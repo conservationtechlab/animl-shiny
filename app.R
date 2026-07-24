@@ -13,6 +13,11 @@
 # steps -- MegaDetector, species classification -- will build on Step 2's
 # output the same way.
 #
+# NOTE: saving intermediate outputs to disk (out_file / out_dir args,
+# WorkingDirectory()'s save-file locations) is intentionally left out of
+# these helpers for now -- that's a separate concern to design properly
+# later, rather than something to bolt on ad hoc here.
+#
 # Required packages:
 #   install.packages(c("shiny", "shinyFiles", "DT", "fs"))
 #   install.packages("animl")   # or devtools::install_github("conservationtechlab/animl")
@@ -34,54 +39,52 @@ library(animl)
 # this skeleton for you: put your cursor inside a function and use
 # Code -> Insert Roxygen Skeleton.
 
+#' Set up animl's working directory for a folder of camera trap media
+#'
+#' Kept separate from build_manifest_from_dir() since it's really a
+#' distinct setup step, not part of building the manifest itself.
+#'
+#' @param imagedir string, path to a folder of camera trap images/videos
+#'
+#' @details WorkingDirectory() does not return an object -- it assigns
+#'   global variables into whatever environment you pass it. We pass
+#'   globalenv() so those variables are available afterwards. We're not
+#'   relying on any of those variables yet (see note at top of file re:
+#'   saving intermediate outputs) -- this just satisfies animl's setup step.
+set_working_directory <- function(imagedir) {
+  WorkingDirectory(imagedir, globalenv())
+}
+
+
 #' Build a file manifest for a directory of camera trap media
 #'
-#' Thin wrapper around animl's WorkingDirectory() + build_file_manifest().
-#' Exists mainly so the Shiny server code calls one function instead of
-#' juggling WorkingDirectory()'s global-variable side effect inline.
+#' Thin wrapper around animl's build_file_manifest().
 #'
 #' @param imagedir string, path to a folder of camera trap images/videos
 #'
 #' @return data frame with one row per file found (FilePath, EXIF fields
 #'   such as DateTimeOriginal, etc.)
-#'
-#' @details WorkingDirectory() does not return an object -- it assigns
-#'   global variables (filemanifest_file, imageframes_file, vidfdir, ...)
-#'   into whatever environment you pass it. We pass globalenv() so those
-#'   variables are available afterwards, including to
-#'   extract_video_frames() below.
 build_manifest_from_dir <- function(imagedir) {
-  WorkingDirectory(imagedir, globalenv())
-  
-  build_file_manifest(
-    imagedir,
-    out_file = filemanifest_file,
-    exif = TRUE
-  )
+  set_working_directory(imagedir)
+  build_file_manifest(imagedir, exif = TRUE)
 }
 
 
 #' Extract still frames from the videos in a file manifest
 #'
-#' Thin wrapper around animl's extract_frames(), using the save-file
-#' locations that build_manifest_from_dir() (via WorkingDirectory())
-#' already set up as global variables.
+#' Thin wrapper around animl's extract_frames().
 #'
 #' @param files data frame, the manifest produced by build_manifest_from_dir()
 #' @param frames_per_video integer, number of frames to sample per video
 #'
 #' @return data frame of still frames (one row per extracted frame), ready
 #'   to be fed into MegaDetector in a later pipeline step
-extract_video_frames <- function(files, frames_per_video, imagedir) {
-  frame_out_dir <- file.path(imagedir, "extracted_frames")
-  dir.create(frame_out_dir, showWarnings = FALSE)
+extract_video_frames <- function(files, frames_per_video) {
   extract_frames(
     files,
-    out_dir  = frame_out_dir,
-    out_file = imageframes_file,
-    frames   = frames_per_video,
-    parallel = TRUE,
-    num_workers  = parallel::detectCores()
+    frames      = frames_per_video,
+    parallel    = TRUE,
+    num_workers = parallel::detectCores()
   )
 }
 
@@ -94,15 +97,18 @@ extract_video_frames <- function(files, frames_per_video, imagedir) {
 # Bootstrap styling out of the box. Note the capital P: fluidPage(), not
 # fluidpage() -- R function names are case-sensitive.
 ui <- fluidPage(
-  
+
   titlePanel("AniML Camera Trap Manifest Builder"),
-  
+
   # sidebarLayout() gives us the classic two-column Shiny layout:
   # a narrow sidebarPanel() for controls, and a wider mainPanel() for output.
   sidebarLayout(
-    
+
     sidebarPanel(
-      
+
+      # ---- Step 1: folder selection + manifest controls -----------------
+      h4("Step 1: Build File Manifest"),
+
       # shinyDirButton() draws a button that, when clicked, opens a folder
       # browser dialog (server-side, so it works even if this app is
       # deployed to a browser and not just run locally in RStudio).
@@ -113,38 +119,38 @@ ui <- fluidPage(
         label = "Select Image Folder",
         title = "Choose a folder containing camera trap images/videos"
       ),
-      
+
       br(), br(),
-      
+
       # verbatimTextOutput() is the UI-side placeholder for text we'll
       # generate on the server with renderPrint(). The "dirpath" id here
       # must match output$dirpath in the server function below --
       # every render*() / *Output() pair is linked by a matching id string.
       verbatimTextOutput("dirpath"),
-      
+
       br(),
-      
+
       # actionButton() just counts clicks -- every time it's clicked,
       # input$run increments by 1. It doesn't do anything by itself;
       # the server watches for that increment (see eventReactive below).
       actionButton("run", "Build File Manifest", class = "btn-primary"),
-      
+
       hr(),
-      
+
       helpText(
         "Selects a directory, then calls animl::build_file_manifest() ",
         "on it (with exif = TRUE) and displays the resulting manifest."
       ),
-      
+
       # downloadButton() pairs with downloadHandler() on the server --
       # clicking it triggers a file save dialog in the browser.
       downloadButton("download_manifest", "Download Manifest (CSV)"),
-      
+
       hr(),
-      
+
       # ---- Step 2: frame extraction controls -------------------------
       h4("Step 2: Extract Frames"),
-      
+
       # numericInput() gives the user a plain number field (with up/down
       # arrows) instead of a slider -- a good fit here since "frames per
       # video" is a small, precise integer rather than a range to explore.
@@ -156,24 +162,23 @@ ui <- fluidPage(
         max     = 20,
         step    = 1
       ),
-      
+
       actionButton("extract", "Extract Frames", class = "btn-primary"),
-      
+
       helpText(
         "Runs animl::extract_frames() on the manifest above, pulling the ",
         "chosen number of still frames from each video for classification. ",
         "Requires Step 1 (Build File Manifest) to have run first."
       )
     ),
-    
+
     mainPanel(
-      textOutput("status"),        # short "Found N file(s)" summary line
-      DTOutput("manifest_table"),  # the interactive results table
-      
-      hr(),
-      
-      textOutput("extract_status"),  # "Extracted N frame(s)" summary line
-      DTOutput("frames_table")       # frame-extraction results
+      # A single table that reflects whichever step has run most
+      # recently: the file manifest after Step 1, then updated in place
+      # to show extracted frames after Step 2 -- rather than stacking a
+      # second table below it.
+      textOutput("status"),
+      DTOutput("results_table")
     )
   )
 )
@@ -187,7 +192,7 @@ ui <- fluidPage(
 # output  = everything we render back to the UI (must match *Output() ids)
 # session = info/hooks tied to this specific browser connection
 server <- function(input, output, session) {
-  
+
   # ---- Folder browsing setup ----------------------------------------------
   # shinyFiles needs to know which top-level "roots" it's allowed to browse
   # from (for security -- you don't want a web app browsing a server's
@@ -199,11 +204,11 @@ server <- function(input, output, session) {
     "R Installation" = R.home(),
     shinyFiles::getVolumes()()
   )
-  
+
   # This wires up input$dir to actually respond to shinyDirButton clicks,
   # using the roots we just defined.
   shinyDirChoose(input, "dir", roots = volumes, session = session)
-  
+
   # ---- Reactive: the currently selected folder ----------------------------
   # reactive() creates a value that automatically recalculates whenever
   # something it depends on (here, input$dir) changes. Think of it like a
@@ -213,13 +218,13 @@ server <- function(input, output, session) {
     # req() is a guard clause: if input$dir isn't set yet (user hasn't
     # picked a folder), stop here quietly instead of throwing an error.
     req(input$dir)
-    
+
     # shinyFiles gives us back a compact internal representation of the
     # chosen path; parseDirPath() converts it into an actual usable
     # file system path string.
     parseDirPath(volumes, input$dir)
   })
-  
+
   # ---- Output: show which folder is selected ------------------------------
   # renderPrint() captures whatever gets printed/cat()'d and sends it to
   # the matching verbatimTextOutput("dirpath") in the UI.
@@ -232,7 +237,7 @@ server <- function(input, output, session) {
       cat("Selected:", selected_dir())
     }
   })
-  
+
   # ---- Reactive: the file manifest, built only on button click ------------
   # eventReactive() is like reactive(), but it only recalculates when a
   # SPECIFIC trigger fires -- here, input$run (the action button) -- rather
@@ -241,7 +246,7 @@ server <- function(input, output, session) {
   # changes (e.g. while the user is still browsing folders).
   manifest <- eventReactive(input$run, {
     req(selected_dir())  # don't run if no folder has been picked
-    
+
     # withProgress()/incProgress() show a progress bar in the UI while
     # this block runs -- purely cosmetic, doesn't affect the logic.
     withProgress(message = "Building file manifest...", value = 0.3, {
@@ -250,21 +255,49 @@ server <- function(input, output, session) {
       files  # eventReactive returns whatever the block's last line is
     })
   })
-  
-  # ---- Output: summary line ("Found N file(s)") ----------------------------
-  output$status <- renderText({
-    req(manifest())
-    paste0("Found ", nrow(manifest()), " file(s).")
+
+  # ---- Reactive: the single table shown in the UI --------------------------
+  # results_data() holds whatever should currently be displayed:
+  #   - the manifest, once Step 1 has run
+  #   - then the extracted frames, once Step 2 has also run
+  # reactiveVal() is a plain mutable reactive value (unlike reactive()/
+  # eventReactive(), which derive their value from a formula) -- we update
+  # it explicitly with observeEvent() below whenever a step completes.
+  results_data <- reactiveVal(NULL)
+
+  observeEvent(input$run, {
+    results_data(manifest())
   })
-  
+
+  observeEvent(input$extract, {
+    req(manifest())  # Step 2 requires Step 1 to have already run
+
+    withProgress(message = "Extracting frames...", value = 0.2, {
+      allframes <- extract_video_frames(manifest(), input$frames_per_video)
+      incProgress(0.8)
+      results_data(allframes)  # replaces the manifest in the same table
+    })
+  })
+
+  # ---- Output: summary line -------------------------------------------------
+  output$status <- renderText({
+    req(results_data())
+    n <- nrow(results_data())
+    if (n == 0) {
+      "No rows to show yet."
+    } else {
+      paste0("Showing ", n, " row(s).")
+    }
+  })
+
   # ---- Output: the interactive table ---------------------------------------
   # renderDT() / DTOutput() is the DT-package equivalent of
   # renderTable()/tableOutput(), but with sorting, searching, and paging.
-  output$manifest_table <- renderDT({
-    req(manifest())
-    datatable(manifest(), options = list(scrollX = TRUE, pageLength = 15))
+  output$results_table <- renderDT({
+    req(results_data())
+    datatable(results_data(), options = list(scrollX = TRUE, pageLength = 15))
   })
-  
+
   # ---- Output: CSV download ---------------------------------------------
   # downloadHandler() needs two pieces:
   #   filename -> what the saved file should be called
@@ -273,41 +306,10 @@ server <- function(input, output, session) {
   output$download_manifest <- downloadHandler(
     filename = function() "file_manifest.csv",
     content = function(file) {
-      req(manifest())
-      write.csv(manifest(), file, row.names = FALSE)
+      req(results_data())
+      write.csv(results_data(), file, row.names = FALSE)
     }
   )
-  
-  # ==========================================================================
-  # Step 2: Extract Frames
-  # ==========================================================================
-  # Same pattern as Step 1: an eventReactive() tied to its own button
-  # (input$extract), so it only runs when the user explicitly asks it to --
-  # not automatically just because manifest() or input$frames_per_video changed.
-  extracted_frames <- eventReactive(input$extract, {
-    # req(manifest()) does double duty here: it stops this block from
-    # running if Step 1 hasn't produced a manifest yet, which is the
-    # "Requires Step 1 to have run first" rule mentioned in the UI help text.
-    req(manifest())
-    
-    withProgress(message = "Extracting frames...", value = 0.2, {
-      allframes <- extract_video_frames(manifest(), input$frames_per_video, selected_dir())
-      incProgress(0.8)
-      allframes
-    })
-  })
-  
-  # ---- Output: frame-extraction summary line ------------------------------
-  output$extract_status <- renderText({
-    req(extracted_frames())
-    paste0("Extracted ", nrow(extracted_frames()), " frame(s).")
-  })
-  
-  # ---- Output: frame-extraction results table ------------------------------
-  output$frames_table <- renderDT({
-    req(extracted_frames())
-    datatable(extracted_frames(), options = list(scrollX = TRUE, pageLength = 15))
-  })
 }
 
 # ============================================================================

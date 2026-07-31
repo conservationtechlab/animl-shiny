@@ -7,13 +7,6 @@
 #           animl::build_file_manifest() on it and preview the result.
 #   Step 2: pick how many frames to pull per video, then run
 #           animl::extract_frames() against that manifest.
-<<<<<<< HEAD
-#
-# The manifest (a table of every image/video file found, plus EXIF metadata
-# like timestamps) from Step 1 is the input Step 2 needs. Later pipeline
-# steps -- MegaDetector, species classification -- will build on Step 2's
-# output the same way.
-=======
 #   Step 3: select a MegaDetector model file, then run animl::detect()
 #           (via load_detector() + parse_detections()) against the
 #           results so far, adding bounding boxes and confidence scores.
@@ -23,7 +16,6 @@
 # (or Step 1's, if there were no videos) feeds Step 3. Later pipeline
 # steps -- species classification -- will build on Step 3's output the
 # same way.
->>>>>>> 77ef911 (Add detector step (MegaDetector) to shiny app (#3))
 #
 # NOTE: saving intermediate outputs to disk (out_file / out_dir args,
 # WorkingDirectory()'s save-file locations) is intentionally left out of
@@ -135,6 +127,12 @@ load_md_detector <- function(model_path, model_type, device) {
 #' @return data frame of parsed detections (bounding boxes + confidence),
 #'   merged with the input manifest -- ready for classification in a
 #'   later pipeline step
+#'
+#' @details detect() returns a named list with two elements --
+#'   $detections (the actual per-image results) and $failed_files (any
+#'   images MegaDetector couldn't process). parse_detections() expects
+#'   just the $detections list, not the wrapper -- passing the wrapper
+#'   directly throws "MD results input must be list" from the Python side.
 detect_animals <- function(detector, files, device,
                            resize_width = 1280, resize_height = 960,
                            batch_size = 4) {
@@ -166,17 +164,10 @@ ui <- fluidPage(
   sidebarLayout(
     
     sidebarPanel(
-<<<<<<< HEAD
-
-      # ---- Step 1: folder selection + manifest controls -----------------
-      h4("Step 1: Build File Manifest"),
-
-=======
       
       # ---- Step 1: folder selection + manifest controls -----------------
       h4("Step 1: Build File Manifest"),
       
->>>>>>> 77ef911 (Add detector step (MegaDetector) to shiny app (#3))
       # shinyDirButton() draws a button that, when clicked, opens a folder
       # browser dialog (server-side, so it works even if this app is
       # deployed to a browser and not just run locally in RStudio).
@@ -213,21 +204,12 @@ ui <- fluidPage(
       # downloadButton() pairs with downloadHandler() on the server --
       # clicking it triggers a file save dialog in the browser.
       downloadButton("download_manifest", "Download Manifest (CSV)"),
-<<<<<<< HEAD
-
-      hr(),
-
-      # ---- Step 2: frame extraction controls -------------------------
-      h4("Step 2: Extract Frames"),
-
-=======
       
       hr(),
       
       # ---- Step 2: frame extraction controls -------------------------
       h4("Step 2: Extract Frames"),
       
->>>>>>> 77ef911 (Add detector step (MegaDetector) to shiny app (#3))
       # numericInput() gives the user a plain number field (with up/down
       # arrows) instead of a slider -- a good fit here since "frames per
       # video" is a small, precise integer rather than a range to explore.
@@ -239,21 +221,13 @@ ui <- fluidPage(
         max     = 20,
         step    = 1
       ),
-<<<<<<< HEAD
-
-      actionButton("extract", "Extract Frames", class = "btn-primary"),
-
-=======
       
       actionButton("extract", "Extract Frames", class = "btn-primary"),
       
->>>>>>> 77ef911 (Add detector step (MegaDetector) to shiny app (#3))
       helpText(
         "Runs animl::extract_frames() on the manifest above, pulling the ",
         "chosen number of still frames from each video for classification. ",
         "Requires Step 1 (Build File Manifest) to have run first."
-<<<<<<< HEAD
-=======
       ),
       
       hr(),
@@ -299,21 +273,14 @@ ui <- fluidPage(
         "results above, adding bounding boxes and confidence scores. ",
         "Requires Step 1 (and Step 2, if your data has videos) to have ",
         "run first."
->>>>>>> 77ef911 (Add detector step (MegaDetector) to shiny app (#3))
       )
     ),
     
     mainPanel(
       # A single table that reflects whichever step has run most
-<<<<<<< HEAD
-      # recently: the file manifest after Step 1, then updated in place
-      # to show extracted frames after Step 2 -- rather than stacking a
-      # second table below it.
-=======
       # recently: the file manifest after Step 1, updated in place after
       # Step 2 (extracted frames) and again after Step 3 (detections) --
       # rather than stacking a separate table per step.
->>>>>>> 77ef911 (Add detector step (MegaDetector) to shiny app (#3))
       textOutput("status"),
       DTOutput("results_table")
     )
@@ -392,11 +359,7 @@ server <- function(input, output, session) {
       files  # eventReactive returns whatever the block's last line is
     })
   })
-<<<<<<< HEAD
-
-=======
   
->>>>>>> 77ef911 (Add detector step (MegaDetector) to shiny app (#3))
   # ---- Reactive: the single table shown in the UI --------------------------
   # results_data() holds whatever should currently be displayed:
   #   - the manifest, once Step 1 has run
@@ -405,36 +368,18 @@ server <- function(input, output, session) {
   # eventReactive(), which derive their value from a formula) -- we update
   # it explicitly with observeEvent() below whenever a step completes.
   results_data <- reactiveVal(NULL)
-<<<<<<< HEAD
-
-  observeEvent(input$run, {
-    results_data(manifest())
-  })
-
-  observeEvent(input$extract, {
-    req(manifest())  # Step 2 requires Step 1 to have already run
-
-    withProgress(message = "Extracting frames...", value = 0.2, {
-      allframes <- extract_video_frames(manifest(), input$frames_per_video)
-      incProgress(0.8)
-      results_data(allframes)  # replaces the manifest in the same table
-    })
-  })
-
-  # ---- Output: summary line -------------------------------------------------
-  output$status <- renderText({
-    req(results_data())
-    n <- nrow(results_data())
-    if (n == 0) {
-      "No rows to show yet."
-    } else {
-      paste0("Showing ", n, " row(s).")
-    }
-=======
+  
+  # Separate from results_data(): this holds the clean, pre-detection
+  # data (manifest or extracted frames) that Step 3 should always detect
+  # against -- NOT whatever is currently displayed. Without this,
+  # clicking "Detect Animals" more than once would re-run detection on
+  # the previous detection output (which already has multiple rows per
+  # image), multiplying rows on every click instead of replacing them.
+  detection_input <- reactiveVal(NULL)
   
   observeEvent(input$run, {
     results_data(manifest())
->>>>>>> 77ef911 (Add detector step (MegaDetector) to shiny app (#3))
+    detection_input(manifest())
   })
   
   observeEvent(input$extract, {
@@ -444,6 +389,7 @@ server <- function(input, output, session) {
       allframes <- extract_video_frames(manifest(), input$frames_per_video)
       incProgress(0.8)
       results_data(allframes)  # replaces the manifest in the same table
+      detection_input(allframes)
     })
   })
   
@@ -472,7 +418,7 @@ server <- function(input, output, session) {
   # req(results_data()) blocks it from running before earlier steps have.
   observeEvent(input$detect, {
     req(selected_model())
-    req(results_data())
+    req(detection_input())
     
     withProgress(message = "Running MegaDetector...", value = 0.1, {
       # NOTE: this loads the model fresh on every click. Fine for now
@@ -482,7 +428,10 @@ server <- function(input, output, session) {
       detector <- load_md_detector(selected_model(), input$model_type, input$device)
       incProgress(0.3)
       
-      detections <- detect_animals(detector, results_data(), input$device)
+      # Always detect against detection_input() (the frozen pre-detection
+      # data), never results_data() -- keeps repeated clicks idempotent
+      # instead of compounding on the previous detection output.
+      detections <- detect_animals(detector, detection_input(), input$device)
       incProgress(0.6)
       
       results_data(detections)  # replaces whatever was in the table before

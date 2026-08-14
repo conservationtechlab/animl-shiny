@@ -7,20 +7,58 @@
 #           animl::build_file_manifest() on it and preview the result.
 #   Step 2: pick how many frames to pull per video, then run
 #           animl::extract_frames() against that manifest.
-#   Step 3: select a MegaDetector model file, then run animl::detect()
+#   Step 3: select a detector model file, then run animl::detect()
 #           (via load_detector() + parse_detections()) against the
-#           results so far, adding bounding boxes and confidence scores.
+#           results so far, adding bounding boxes, confidence scores,
+#           and (if a class list is provided) real category labels.
 #
 # The manifest (a table of every image/video file found, plus EXIF metadata
 # like timestamps) from Step 1 is the input Step 2 needs; Step 2's output
 # (or Step 1's, if there were no videos) feeds Step 3. Later pipeline
-# steps -- species classification -- will build on Step 3's output the
-# same way.
+# steps -- sequence-based classification -- will build on Step 3's output
+# the same way.
 #
 # NOTE: saving intermediate outputs to disk (out_file / out_dir args,
 # WorkingDirectory()'s save-file locations) is intentionally left out of
 # these helpers for now -- that's a separate concern to design properly
 # later, rather than something to bolt on ad hoc here.
+#
+# DETECTOR MODEL_TYPE -- IMPORTANT, found by reading animl-py's own
+# detect.py source directly:
+#
+#   animl-py's _convert_detections() silently does `category[j] += 1`
+#   whenever model_type is one of the real MegaDetector variants
+#   ("mdv5", "mdv6", "mdv1000-*"). This exists because real MegaDetector
+#   reserves category 0 for "empty" and starts real classes at 1. A
+#   CUSTOM-TRAINED model (like sdzwa_buow_detector_2026.pt) is NOT
+#   MegaDetector and was never trained with that convention -- its class
+#   list is 0-indexed (0=bird, 1=bobcat, 2=cattle, ...). Loading it with
+#   model_type="mdv6" silently shifted every category by +1 before we
+#   ever saw it, which is why a confirmed corvid photo showed category=4
+#   ("coyote") instead of the correct category=3 ("corvid") -- the raw
+#   model output was actually right, the +1 shift broke it.
+#
+#   Per load_detector()'s own docstring: "for yolo models v6+, use
+#   'yolo', for v5, use 'yolovv5'". Custom (non-MegaDetector) models
+#   should use "yolo" (v6+) or "yolov5" (v5) -- NOT "mdv5"/"mdv6", which
+#   are reserved for genuine MegaDetector releases and apply the +1
+#   shift unconditionally.
+#
+# CATEGORY LABELS -- also found in the same source read: detect() has a
+# native `category_map` parameter (a dict of {category_id: label}) that
+# gets applied directly during detection -- this replaces our earlier
+# custom apply_class_labels()/offset guessing entirely. We build this
+# map straight from the class list CSV's id/class columns and pass it
+# into detect(); animl-py's own code explicitly handles string-keyed
+# maps "ie from reticulate", so this works cleanly from R.
+#
+# CONFIDENCE FILTERING -- detect() also has a native
+# `confidence_threshold` parameter that drops weak detections before
+# they're even returned. When every detection in an image falls below
+# that threshold, animl-py itself returns category=None/
+# category_label="empty" for that image -- so passing this natively
+# gives the same "show empty rather than a weak guess" behavior we were
+# previously hand-rolling after the fact, without extra custom logic.
 #
 # Required packages:
 #   install.packages(c("shiny", "shinyFiles", "DT", "fs"))
@@ -82,7 +120,7 @@ build_manifest_from_dir <- function(imagedir) {
 #' @param frames_per_video integer, number of frames to sample per video
 #'
 #' @return data frame of still frames (one row per extracted frame), ready
-#'   to be fed into MegaDetector in a later pipeline step
+#'   to be fed into the detector in a later pipeline step
 extract_video_frames <- function(files, frames_per_video) {
   extract_frames(
     files,
@@ -93,15 +131,20 @@ extract_video_frames <- function(files, frames_per_video) {
 }
 
 
-#' Load a MegaDetector model
+#' Load a detector model
 #'
 #' Kept separate from detect_animals() for the same reason
 #' set_working_directory() is separate from build_manifest_from_dir() --
 #' loading the model is a distinct setup step, not part of running
 #' detection itself.
 #'
-#' @param model_path string, path to a MegaDetector model file (.pt)
-#' @param model_type string, animl model type identifier (e.g. "mdv5", "mdv6")
+#' @param model_path string, path to a detector model file (.pt)
+#' @param model_type string, animl model type identifier. Use "mdv5"/
+#'   "mdv6" ONLY for genuine MegaDetector releases (these apply an
+#'   automatic +1 category shift animl-py assumes for MD's own
+#'   empty-at-0 convention). For a custom-trained model like ours, use
+#'   "yolo" (YOLO v6+) or "yolov5" (YOLO v5) instead -- see the
+#'   MODEL_TYPE note at the top of this file.
 #' @param device string, compute device to load the model onto
 #'   (e.g. "cuda:0" for GPU, "cpu" otherwise)
 #'
@@ -111,37 +154,117 @@ load_md_detector <- function(model_path, model_type, device) {
 }
 
 
-#' Run MegaDetector on a file manifest and parse the results
+#' Load a class list and build a category_map for detect()
 #'
-#' Thin wrapper around animl's detect() + parse_detections(). Resize
-#' dimensions and batch size default to the values animl's own README
-#' example uses for MDv5 (1280x960, batch_size = 4).
+#' Wraps animl's load_class_list(), then reshapes it into the named
+#' list format detect()'s category_map parameter expects: id -> class
+#' name. Passing this into detect() directly (rather than post-hoc
+#' merging labels onto results ourselves) is animl-py's own intended
+#' mechanism for custom-model category labels -- see the CATEGORY
+#' LABELS note at the top of this file.
+#'
+#' @param class_list_path string, path to a class list CSV file. Must
+#'   have an id-like column and a class/label-like column.
+#'
+#' @return a named list suitable for detect()'s category_map argument,
+#'   e.g. list(`0` = "bird", `1` = "bobcat", ...)
+build_category_map <- function(class_list_path) {
+  class_list <- load_class_list(class_list_path)
+  
+  id_col    <- intersect(c("id", "ID", "category", "class_id"), names(class_list))[1]
+  label_col <- intersect(c("class", "Class", "name", "label"), names(class_list))[1]
+  
+  if (is.na(id_col) || is.na(label_col)) {
+    warning("Could not identify ID/label columns in class list -- category_map will be empty.")
+    return(list())
+  }
+  
+  stats::setNames(
+    as.list(as.character(class_list[[label_col]])),
+    as.character(as.integer(class_list[[id_col]]))
+  )
+}
+
+
+#' Drop duplicate candidate detections for the same bounding box
+#'
+#' The model can occasionally return multiple ranked category guesses
+#' for what is really the same detected region (near-identical bbox
+#' coordinates, different category/conf) -- this looks like separate
+#' detections in the results table but isn't. Keeps only the
+#' highest-confidence guess per (filepath, rounded bbox) group. Kept as
+#' a safety net even after fixing the category_map/model_type issue,
+#' since it's a distinct, separately-confirmed behavior.
+#'
+#' @param detections data frame, output of detect_animals()
+#' @param bbox_tolerance numeric, decimal places to round bbox coords to
+#'   before grouping -- tiny floating-point differences between "the
+#'   same" box shouldn't count as different boxes
+#'
+#' @return detections with only the top-confidence row per distinct box
+drop_duplicate_boxes <- function(detections, bbox_tolerance = 3) {
+  box_key <- paste(
+    detections$filepath,
+    round(detections$bbox_x, bbox_tolerance),
+    round(detections$bbox_y, bbox_tolerance),
+    round(detections$bbox_w, bbox_tolerance),
+    round(detections$bbox_h, bbox_tolerance)
+  )
+  
+  # Order by confidence descending, then keep the first (highest-conf)
+  # row per box_key.
+  detections <- detections[order(-detections$conf), ]
+  detections[!duplicated(box_key[order(-detections$conf)]), ]
+}
+
+
+#' Run the detector on a file manifest and parse the results
+#'
+#' Thin wrapper around animl's detect() + parse_detections(). Passes
+#' category_map and confidence_threshold straight into detect() --
+#' animl-py's own native mechanisms for category labels and confidence
+#' filtering -- rather than the custom post-hoc logic this app used
+#' previously. See the notes at the top of this file for why.
 #'
 #' @param detector an animl detector object, from load_md_detector()
 #' @param files data frame, the manifest/frames to run detection on
 #' @param device string, compute device to run inference on
-#' @param resize_width integer, width MegaDetector resizes images to
-#' @param resize_height integer, height MegaDetector resizes images to
+#' @param category_map named list, id -> label, from build_category_map().
+#'   Pass NULL to skip (category_label will show animl's default,
+#'   typically "unknown" for non-empty detections).
+#' @param confidence_threshold numeric, detections below this are
+#'   dropped by detect() itself before being returned; an image with no
+#'   detections surviving this threshold comes back as
+#'   category_label = "empty" natively.
+#' @param resize_width integer, width the detector resizes images to.
+#'   Defaults to 2048, the native width of these photos (exactly
+#'   divisible by 32, a YOLO stride requirement).
+#' @param resize_height integer, height the detector resizes images to.
+#'   Defaults to 1440, the native height (also divisible by 32).
 #' @param batch_size integer, number of images processed per batch
 #'
-#' @return data frame of parsed detections (bounding boxes + confidence),
-#'   merged with the input manifest -- ready for classification in a
-#'   later pipeline step
+#' @return data frame of parsed detections (bounding boxes + confidence
+#'   + category labels), merged with the input manifest -- ready for
+#'   classification in a later pipeline step
 #'
 #' @details detect() returns a named list with two elements --
 #'   $detections (the actual per-image results) and $failed_files (any
-#'   images MegaDetector couldn't process). parse_detections() expects
+#'   images the detector couldn't process). parse_detections() expects
 #'   just the $detections list, not the wrapper -- passing the wrapper
 #'   directly throws "MD results input must be list" from the Python side.
 detect_animals <- function(detector, files, device,
-                           resize_width = 1280, resize_height = 960,
-                           batch_size = 4) {
+                           category_map = NULL,
+                           confidence_threshold = 0.1,
+                           resize_width = 2048, resize_height = 1440,
+                           batch_size = 1) {
   mdraw <- detect(
     detector, files,
-    resize_width  = resize_width,
-    resize_height = resize_height,
-    batch_size    = batch_size,
-    device        = device
+    resize_width          = resize_width,
+    resize_height         = resize_height,
+    batch_size             = batch_size,
+    device                 = device,
+    category_map           = category_map,
+    confidence_threshold    = confidence_threshold
   )
   
   parse_detections(mdraw$detections, manifest = files)
@@ -237,12 +360,12 @@ ui <- fluidPage(
       
       # shinyFilesButton() is shinyFiles' file-picker counterpart to
       # shinyDirButton() -- same browsing mechanism, but for picking a
-      # single file (here, a MegaDetector .pt model file) instead of a
+      # single file (here, a detector .pt model file) instead of a
       # folder.
       shinyFilesButton(
         id     = "model_file",
         label  = "Select Detector Model",
-        title  = "Choose a MegaDetector model file (.pt)",
+        title  = "Choose a detector model file (.pt)",
         multiple = FALSE
       ),
       
@@ -252,11 +375,42 @@ ui <- fluidPage(
       
       br(),
       
+      # Custom detectors (species-specific models, unlike generic
+      # MegaDetector) typically ship with their own class list CSV
+      # mapping category IDs to real class names. Required now (rather
+      # than optional) since category_map is passed natively into
+      # detect() -- see the CATEGORY LABELS note at the top of this file.
+      shinyFilesButton(
+        id       = "class_list_file",
+        label    = "Select Class List",
+        title    = "Choose a class list CSV file (maps category IDs to labels)",
+        multiple = FALSE
+      ),
+      
+      br(), br(),
+      
+      verbatimTextOutput("classlistpath"),
+      
+      br(),
+      
       selectInput(
         inputId  = "model_type",
         label    = "Model type",
-        choices  = c("MegaDetector v5" = "mdv5", "MegaDetector v6" = "mdv6"),
-        selected = "mdv5"
+        choices  = c(
+          "Custom YOLO (v6+)"       = "yolo",
+          "Custom YOLOv5"           = "yolov5",
+          "MegaDetector v5"         = "mdv5",
+          "MegaDetector v6"         = "mdv6"
+        ),
+        selected = "yolo"
+      ),
+      
+      helpText(
+        "Use \"Custom YOLO\" for a custom-trained model like ours -- ",
+        "\"MegaDetector v5/v6\" are ONLY for genuine MegaDetector ",
+        "releases, since those apply an automatic +1 category shift ",
+        "that a custom model's class list doesn't expect. See the ",
+        "MODEL_TYPE note at the top of app.R for the full explanation."
       ),
       
       selectInput(
@@ -266,13 +420,22 @@ ui <- fluidPage(
         selected = "cuda:0"
       ),
       
+      numericInput(
+        inputId = "confidence_threshold",
+        label   = "Confidence threshold (detections below this are dropped)",
+        value   = 0.1,
+        min     = 0,
+        max     = 1,
+        step    = 0.05
+      ),
+      
       actionButton("detect", "Detect Animals", class = "btn-primary"),
       
       helpText(
-        "Loads the selected MegaDetector model and runs it on the ",
-        "results above, adding bounding boxes and confidence scores. ",
-        "Requires Step 1 (and Step 2, if your data has videos) to have ",
-        "run first."
+        "Loads the selected detector model and runs it on the results ",
+        "above, adding bounding boxes, confidence scores, and category ",
+        "labels (from the class list). Requires Step 1 (and Step 2, if ",
+        "your data has videos) to have run first."
       )
     ),
     
@@ -364,6 +527,7 @@ server <- function(input, output, session) {
   # results_data() holds whatever should currently be displayed:
   #   - the manifest, once Step 1 has run
   #   - then the extracted frames, once Step 2 has also run
+  #   - then the detections, once Step 3 has also run
   # reactiveVal() is a plain mutable reactive value (unlike reactive()/
   # eventReactive(), which derive their value from a formula) -- we update
   # it explicitly with observeEvent() below whenever a step completes.
@@ -396,7 +560,7 @@ server <- function(input, output, session) {
   # ---- Model file picker setup ---------------------------------------------
   # Same pattern as the folder picker, but shinyFileChoose() for a single
   # file instead of shinyDirChoose() for a directory. filetypes restricts
-  # the browser dialog to .pt files (the format MegaDetector models ship as).
+  # the browser dialog to .pt files.
   shinyFileChoose(input, "model_file", roots = volumes, session = session,
                   filetypes = c("pt"))
   
@@ -413,25 +577,63 @@ server <- function(input, output, session) {
     }
   })
   
+  # ---- Class list file picker setup -----------------------------------------
+  # Same pattern as the model file picker.
+  shinyFileChoose(input, "class_list_file", roots = volumes, session = session,
+                  filetypes = c("csv"))
+  
+  selected_class_list <- reactive({
+    req(input$class_list_file)
+    parseFilePaths(volumes, input$class_list_file)$datapath
+  })
+  
+  output$classlistpath <- renderPrint({
+    if (is.null(input$class_list_file) || is.integer(input$class_list_file)) {
+      cat("No class list selected (category labels will show animl's default)")
+    } else {
+      cat("Selected:", selected_class_list())
+    }
+  })
+  
   # ---- Step 3: Detect Animals -----------------------------------------------
   # Same pattern as Steps 1 and 2: only runs on its own button click, and
-  # req(results_data()) blocks it from running before earlier steps have.
+  # req(detection_input()) blocks it from running before earlier steps have.
   observeEvent(input$detect, {
     req(selected_model())
     req(detection_input())
     
-    withProgress(message = "Running MegaDetector...", value = 0.1, {
+    withProgress(message = "Running detector...", value = 0.1, {
       # NOTE: this loads the model fresh on every click. Fine for now
       # while we're building the pipeline step by step, but worth
       # caching the loaded detector later if this becomes a bottleneck
       # (e.g. reusing it across multiple detection runs in one session).
       detector <- load_md_detector(selected_model(), input$model_type, input$device)
-      incProgress(0.3)
+      incProgress(0.2)
+      
+      # Build the category_map from the class list, if one was
+      # selected -- passed natively into detect() rather than merged
+      # on after the fact (see CATEGORY LABELS note at top of file).
+      category_map <- NULL
+      if (!is.null(input$class_list_file) && !is.integer(input$class_list_file)) {
+        category_map <- build_category_map(selected_class_list())
+      }
+      incProgress(0.1)
       
       # Always detect against detection_input() (the frozen pre-detection
       # data), never results_data() -- keeps repeated clicks idempotent
       # instead of compounding on the previous detection output.
-      detections <- detect_animals(detector, detection_input(), input$device)
+      detections <- detect_animals(
+        detector, detection_input(), input$device,
+        category_map          = category_map,
+        confidence_threshold   = input$confidence_threshold
+      )
+      
+      # The model can return multiple ranked category guesses for the
+      # same physical detection (near-identical bbox, different
+      # category/conf) -- collapse those down to just the top guess per
+      # box before anything else, so downstream steps see one row per
+      # real detected object.
+      detections <- drop_duplicate_boxes(detections)
       incProgress(0.6)
       
       results_data(detections)  # replaces whatever was in the table before

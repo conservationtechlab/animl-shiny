@@ -11,6 +11,8 @@
 #           (via load_detector() + parse_detections()) against the
 #           results so far, adding bounding boxes, confidence scores,
 #           and (if a class list is provided) real category labels.
+#   Step 4 (preview): click a row in the results table to view that
+#           image with its bounding box drawn on it.
 #
 # The manifest (a table of every image/video file found, plus EXIF metadata
 # like timestamps) from Step 1 is the input Step 2 needs; Step 2's output
@@ -34,34 +36,41 @@
 #   MegaDetector and was never trained with that convention -- its class
 #   list is 0-indexed (0=bird, 1=bobcat, 2=cattle, ...). Loading it with
 #   model_type="mdv6" silently shifted every category by +1 before we
-#   ever saw it, which is why a confirmed corvid photo showed category=4
-#   ("coyote") instead of the correct category=3 ("corvid") -- the raw
-#   model output was actually right, the +1 shift broke it.
+#   ever saw it.
 #
 #   Per load_detector()'s own docstring: "for yolo models v6+, use
 #   'yolo', for v5, use 'yolovv5'". Custom (non-MegaDetector) models
 #   should use "yolo" (v6+) or "yolov5" (v5) -- NOT "mdv5"/"mdv6", which
-#   are reserved for genuine MegaDetector releases and apply the +1
-#   shift unconditionally.
+#   are reserved for genuine MegaDetector releases.
 #
-# CATEGORY LABELS -- also found in the same source read: detect() has a
-# native `category_map` parameter (a dict of {category_id: label}) that
-# gets applied directly during detection -- this replaces our earlier
-# custom apply_class_labels()/offset guessing entirely. We build this
-# map straight from the class list CSV's id/class columns and pass it
-# into detect(); animl-py's own code explicitly handles string-keyed
-# maps "ie from reticulate", so this works cleanly from R.
+# CATEGORY LABELS -- detect() has a native `category_map` parameter (a
+# dict of {category_id: label}) applied directly during detection.
+# IMPORTANT: category_map must NEVER be NULL or a bare empty R list() --
+# detect()'s own source unconditionally calls category_map.items() near
+# the top of the function, crashing with "'NoneType' object has no
+# attribute 'items'" on None, and an empty unnamed R list() is
+# ambiguous when converted by reticulate (could become a Python list,
+# which also lacks .items()). reticulate::dict() sidesteps both issues.
+# For genuine MegaDetector models (mdv5/mdv6/mdv1000-*) run without a
+# custom class list, default_md_category_map() supplies MD's own
+# standard empty/animal/person/vehicle categories -- confirmed working
+# against a real md_v5a.0.0.pt file.
 #
 # CONFIDENCE FILTERING -- detect() also has a native
 # `confidence_threshold` parameter that drops weak detections before
-# they're even returned. When every detection in an image falls below
-# that threshold, animl-py itself returns category=None/
-# category_label="empty" for that image -- so passing this natively
-# gives the same "show empty rather than a weak guess" behavior we were
-# previously hand-rolling after the fact, without extra custom logic.
+# they're even returned; an image with nothing surviving that threshold
+# comes back as category_label = "empty" natively.
+#
+# RESIZE DIMENSIONS -- MDv5/YOLOv5 requires a SQUARE input (the
+# documented MegaDetector v5 standard is 1280x1280, confirmed against
+# animl-py's own MEGADETECTORv5_SIZE constant). Our custom YOLO11 model
+# runs fine at native resolution (2048x1440, non-square). Passing a
+# non-square resize to MDv5 throws a PyTorch tensor-shape-mismatch
+# error from deep inside the model -- resize dimensions are chosen
+# based on model_type in the server code below, not hardcoded.
 #
 # Required packages:
-#   install.packages(c("shiny", "shinyFiles", "DT", "fs"))
+#   install.packages(c("shiny", "shinyFiles", "DT", "fs", "magick"))
 #   install.packages("animl")   # or devtools::install_github("conservationtechlab/animl")
 # ============================================================================
 
@@ -69,6 +78,7 @@ library(shiny)
 library(shinyFiles)
 library(DT)
 library(fs)
+library(magick)
 library(animl)
 
 
@@ -90,9 +100,7 @@ library(animl)
 #'
 #' @details WorkingDirectory() does not return an object -- it assigns
 #'   global variables into whatever environment you pass it. We pass
-#'   globalenv() so those variables are available afterwards. We're not
-#'   relying on any of those variables yet (see note at top of file re:
-#'   saving intermediate outputs) -- this just satisfies animl's setup step.
+#'   globalenv() so those variables are available afterwards.
 set_working_directory <- function(imagedir) {
   WorkingDirectory(imagedir, globalenv())
 }
@@ -133,20 +141,12 @@ extract_video_frames <- function(files, frames_per_video) {
 
 #' Load a detector model
 #'
-#' Kept separate from detect_animals() for the same reason
-#' set_working_directory() is separate from build_manifest_from_dir() --
-#' loading the model is a distinct setup step, not part of running
-#' detection itself.
-#'
 #' @param model_path string, path to a detector model file (.pt)
 #' @param model_type string, animl model type identifier. Use "mdv5"/
-#'   "mdv6" ONLY for genuine MegaDetector releases (these apply an
-#'   automatic +1 category shift animl-py assumes for MD's own
-#'   empty-at-0 convention). For a custom-trained model like ours, use
-#'   "yolo" (YOLO v6+) or "yolov5" (YOLO v5) instead -- see the
-#'   MODEL_TYPE note at the top of this file.
+#'   "mdv6" ONLY for genuine MegaDetector releases. For a custom-trained
+#'   model like ours, use "yolo" (YOLO v6+) or "yolov5" (YOLO v5)
+#'   instead -- see the MODEL_TYPE note at the top of this file.
 #' @param device string, compute device to load the model onto
-#'   (e.g. "cuda:0" for GPU, "cpu" otherwise)
 #'
 #' @return an animl detector object, ready to be passed to detect_animals()
 load_md_detector <- function(model_path, model_type, device) {
@@ -156,18 +156,11 @@ load_md_detector <- function(model_path, model_type, device) {
 
 #' Load a class list and build a category_map for detect()
 #'
-#' Wraps animl's load_class_list(), then reshapes it into the named
-#' list format detect()'s category_map parameter expects: id -> class
-#' name. Passing this into detect() directly (rather than post-hoc
-#' merging labels onto results ourselves) is animl-py's own intended
-#' mechanism for custom-model category labels -- see the CATEGORY
-#' LABELS note at the top of this file.
-#'
 #' @param class_list_path string, path to a class list CSV file. Must
 #'   have an id-like column and a class/label-like column.
 #'
-#' @return a named list suitable for detect()'s category_map argument,
-#'   e.g. list(`0` = "bird", `1` = "bobcat", ...)
+#' @return a Python dict (via reticulate) suitable for detect()'s
+#'   category_map argument, e.g. {0: "bird", 1: "bobcat", ...}
 build_category_map <- function(class_list_path) {
   class_list <- load_class_list(class_list_path)
   
@@ -185,13 +178,8 @@ build_category_map <- function(class_list_path) {
   )
 }
 
+
 #' Default category map for genuine MegaDetector models
-#'
-#' MegaDetector's own standard categories, used as a fallback when
-#' model_type is "mdv5"/"mdv6" (or an mdv1000 variant) and no custom
-#' class list was selected -- without this, detect() crashes for MD
-#' models run without a class list, since our category_map would
-#' otherwise be NULL.
 #'
 #' @return named list, id -> label, matching MegaDetector's standard
 #'   empty/animal/person/vehicle categories
@@ -199,20 +187,12 @@ default_md_category_map <- function() {
   list(`0` = "empty", `1` = "animal", `2` = "person", `3` = "vehicle")
 }
 
+
 #' Drop duplicate candidate detections for the same bounding box
-#'
-#' The model can occasionally return multiple ranked category guesses
-#' for what is really the same detected region (near-identical bbox
-#' coordinates, different category/conf) -- this looks like separate
-#' detections in the results table but isn't. Keeps only the
-#' highest-confidence guess per (filepath, rounded bbox) group. Kept as
-#' a safety net even after fixing the category_map/model_type issue,
-#' since it's a distinct, separately-confirmed behavior.
 #'
 #' @param detections data frame, output of detect_animals()
 #' @param bbox_tolerance numeric, decimal places to round bbox coords to
-#'   before grouping -- tiny floating-point differences between "the
-#'   same" box shouldn't count as different boxes
+#'   before grouping
 #'
 #' @return detections with only the top-confidence row per distinct box
 drop_duplicate_boxes <- function(detections, bbox_tolerance = 3) {
@@ -224,8 +204,6 @@ drop_duplicate_boxes <- function(detections, bbox_tolerance = 3) {
     round(detections$bbox_h, bbox_tolerance)
   )
   
-  # Order by confidence descending, then keep the first (highest-conf)
-  # row per box_key.
   detections <- detections[order(-detections$conf), ]
   detections[!duplicated(box_key[order(-detections$conf)]), ]
 }
@@ -233,38 +211,26 @@ drop_duplicate_boxes <- function(detections, bbox_tolerance = 3) {
 
 #' Run the detector on a file manifest and parse the results
 #'
-#' Thin wrapper around animl's detect() + parse_detections(). Passes
-#' category_map and confidence_threshold straight into detect() --
-#' animl-py's own native mechanisms for category labels and confidence
-#' filtering -- rather than the custom post-hoc logic this app used
-#' previously. See the notes at the top of this file for why.
-#'
 #' @param detector an animl detector object, from load_md_detector()
 #' @param files data frame, the manifest/frames to run detection on
 #' @param device string, compute device to run inference on
-#' @param category_map named list, id -> label, from build_category_map().
-#'   Pass NULL to skip (category_label will show animl's default,
-#'   typically "unknown" for non-empty detections).
+#' @param category_map dict (via reticulate::dict() or build_category_map()),
+#'   id -> label. Never pass NULL or a bare empty R list() -- see the
+#'   CATEGORY LABELS note at the top of this file.
 #' @param confidence_threshold numeric, detections below this are
-#'   dropped by detect() itself before being returned; an image with no
-#'   detections surviving this threshold comes back as
-#'   category_label = "empty" natively.
+#'   dropped by detect() itself before being returned
 #' @param resize_width integer, width the detector resizes images to.
-#'   Defaults to 2048, the native width of these photos (exactly
-#'   divisible by 32, a YOLO stride requirement).
+#'   MDv5/YOLOv5 needs a square shape (1280x1280) -- see the RESIZE
+#'   DIMENSIONS note at the top of this file.
 #' @param resize_height integer, height the detector resizes images to.
-#'   Defaults to 1440, the native height (also divisible by 32).
 #' @param batch_size integer, number of images processed per batch
 #'
 #' @return data frame of parsed detections (bounding boxes + confidence
-#'   + category labels), merged with the input manifest -- ready for
-#'   classification in a later pipeline step
+#'   + category labels), merged with the input manifest
 #'
 #' @details detect() returns a named list with two elements --
-#'   $detections (the actual per-image results) and $failed_files (any
-#'   images the detector couldn't process). parse_detections() expects
-#'   just the $detections list, not the wrapper -- passing the wrapper
-#'   directly throws "MD results input must be list" from the Python side.
+#'   $detections and $failed_files. parse_detections() expects just the
+#'   $detections list, not the wrapper.
 detect_animals <- function(detector, files, device,
                            category_map = reticulate::dict(),
                            confidence_threshold = 0.1,
@@ -273,30 +239,63 @@ detect_animals <- function(detector, files, device,
   mdraw <- detect(
     detector, files,
     resize_width          = resize_width,
-    resize_height         = resize_height,
+    resize_height          = resize_height,
     batch_size             = batch_size,
     device                 = device,
     category_map           = category_map,
-    confidence_threshold    = confidence_threshold
+    confidence_threshold   = confidence_threshold
   )
   
   parse_detections(mdraw$detections, manifest = files)
 }
 
 
+#' Draw a bounding box onto an image for preview
+#'
+#' Reads the image at filepath, draws the given normalized bounding box
+#' (bbox_x/bbox_y = top-left corner, bbox_w/bbox_h = width/height, all
+#' as fractions of image size -- matching the columns detect_animals()
+#' produces) as a red rectangle, and saves the result to a temp PNG.
+#'
+#' @param filepath string, path to the source image
+#' @param bbox_x,bbox_y,bbox_w,bbox_h numeric, normalized (0-1) box
+#'   coordinates. Any of these being NA (e.g. an "empty" detection row
+#'   with no real box) skips drawing and just returns the plain image.
+#'
+#' @return string, path to a temp PNG file with the box drawn (or the
+#'   plain image if no valid box was given)
+draw_bbox_preview <- function(filepath, bbox_x, bbox_y, bbox_w, bbox_h) {
+  img <- image_read(filepath)
+  info <- image_info(img)
+  
+  has_box <- !any(is.na(c(bbox_x, bbox_y, bbox_w, bbox_h)))
+  
+  if (has_box) {
+    # Convert normalized (0-1) coordinates to actual pixel coordinates
+    # for this specific image's dimensions.
+    x0 <- bbox_x * info$width
+    y0 <- bbox_y * info$height
+    x1 <- (bbox_x + bbox_w) * info$width
+    y1 <- (bbox_y + bbox_h) * info$height
+    
+    img <- image_draw(img)
+    rect(x0, y0, x1, y1, border = "red", lwd = max(2, info$width / 400))
+    dev.off()
+  }
+  
+  out_path <- tempfile(fileext = ".png")
+  image_write(img, out_path)
+  out_path
+}
+
+
 # ============================================================================
 # UI -- defines what the user SEES. No logic runs here, just layout.
 # ============================================================================
-#
-# fluidPage() is the standard Shiny page container -- responsive width,
-# Bootstrap styling out of the box. Note the capital P: fluidPage(), not
-# fluidpage() -- R function names are case-sensitive.
 ui <- fluidPage(
   
   titlePanel("AniML Camera Trap Manifest Builder"),
   
-  # sidebarLayout() gives us the classic two-column Shiny layout:
-  # a narrow sidebarPanel() for controls, and a wider mainPanel() for output.
   sidebarLayout(
     
     sidebarPanel(
@@ -304,11 +303,6 @@ ui <- fluidPage(
       # ---- Step 1: folder selection + manifest controls -----------------
       h4("Step 1: Build File Manifest"),
       
-      # shinyDirButton() draws a button that, when clicked, opens a folder
-      # browser dialog (server-side, so it works even if this app is
-      # deployed to a browser and not just run locally in RStudio).
-      # id = "dir" is how we'll refer to whatever gets picked, on the
-      # server side, as input$dir.
       shinyDirButton(
         id = "dir",
         label = "Select Image Folder",
@@ -317,17 +311,10 @@ ui <- fluidPage(
       
       br(), br(),
       
-      # verbatimTextOutput() is the UI-side placeholder for text we'll
-      # generate on the server with renderPrint(). The "dirpath" id here
-      # must match output$dirpath in the server function below --
-      # every render*() / *Output() pair is linked by a matching id string.
       verbatimTextOutput("dirpath"),
       
       br(),
       
-      # actionButton() just counts clicks -- every time it's clicked,
-      # input$run increments by 1. It doesn't do anything by itself;
-      # the server watches for that increment (see eventReactive below).
       actionButton("run", "Build File Manifest", class = "btn-primary"),
       
       hr(),
@@ -337,8 +324,6 @@ ui <- fluidPage(
         "on it (with exif = TRUE) and displays the resulting manifest."
       ),
       
-      # downloadButton() pairs with downloadHandler() on the server --
-      # clicking it triggers a file save dialog in the browser.
       downloadButton("download_manifest", "Download Manifest (CSV)"),
       
       hr(),
@@ -346,13 +331,10 @@ ui <- fluidPage(
       # ---- Step 2: frame extraction controls -------------------------
       h4("Step 2: Extract Frames"),
       
-      # numericInput() gives the user a plain number field (with up/down
-      # arrows) instead of a slider -- a good fit here since "frames per
-      # video" is a small, precise integer rather than a range to explore.
       numericInput(
         inputId = "frames_per_video",
         label   = "Frames to pull per video",
-        value   = 3,     # sensible default, matches the animl README example
+        value   = 3,
         min     = 1,
         max     = 20,
         step    = 1
@@ -371,10 +353,6 @@ ui <- fluidPage(
       # ---- Step 3: detector controls ----------------------------------
       h4("Step 3: Detect Animals"),
       
-      # shinyFilesButton() is shinyFiles' file-picker counterpart to
-      # shinyDirButton() -- same browsing mechanism, but for picking a
-      # single file (here, a detector .pt model file) instead of a
-      # folder.
       shinyFilesButton(
         id     = "model_file",
         label  = "Select Detector Model",
@@ -388,14 +366,9 @@ ui <- fluidPage(
       
       br(),
       
-      # Custom detectors (species-specific models, unlike generic
-      # MegaDetector) typically ship with their own class list CSV
-      # mapping category IDs to real class names. Required now (rather
-      # than optional) since category_map is passed natively into
-      # detect() -- see the CATEGORY LABELS note at the top of this file.
       shinyFilesButton(
         id       = "class_list_file",
-        label    = "Select Class List",
+        label    = "Select Class List (optional for MegaDetector)",
         title    = "Choose a class list CSV file (maps category IDs to labels)",
         multiple = FALSE
       ),
@@ -421,9 +394,7 @@ ui <- fluidPage(
       helpText(
         "Use \"Custom YOLO\" for a custom-trained model like ours -- ",
         "\"MegaDetector v5/v6\" are ONLY for genuine MegaDetector ",
-        "releases, since those apply an automatic +1 category shift ",
-        "that a custom model's class list doesn't expect. See the ",
-        "MODEL_TYPE note at the top of app.R for the full explanation."
+        "releases. See the MODEL_TYPE note at the top of app.R."
       ),
       
       selectInput(
@@ -447,18 +418,34 @@ ui <- fluidPage(
       helpText(
         "Loads the selected detector model and runs it on the results ",
         "above, adding bounding boxes, confidence scores, and category ",
-        "labels (from the class list). Requires Step 1 (and Step 2, if ",
-        "your data has videos) to have run first."
+        "labels. Requires Step 1 (and Step 2, if your data has videos) ",
+        "to have run first."
+      ),
+      
+      hr(),
+      
+      # ---- Step 4: image preview ---------------------------------------
+      h4("Step 4: View Selected Detection"),
+      
+      helpText(
+        "Click any row in the results table to view that image with ",
+        "its bounding box drawn on it."
       )
     ),
     
     mainPanel(
-      # A single table that reflects whichever step has run most
-      # recently: the file manifest after Step 1, updated in place after
-      # Step 2 (extracted frames) and again after Step 3 (detections) --
-      # rather than stacking a separate table per step.
       textOutput("status"),
-      DTOutput("results_table")
+      
+      # selection = "single" enables clicking a row to select it --
+      # that selection drives the image preview below.
+      DTOutput("results_table"),
+      
+      hr(),
+      
+      # imageOutput() is the UI-side placeholder for the image built by
+      # renderImage() on the server -- same id-matching pattern as
+      # every other output/render pair in this app.
+      imageOutput("bbox_preview", height = "auto")
     )
   )
 )
@@ -467,91 +454,41 @@ ui <- fluidPage(
 # ============================================================================
 # SERVER -- defines what the app DOES. Runs once per user session.
 # ============================================================================
-#
-# input   = everything the user has clicked/typed/selected in the UI
-# output  = everything we render back to the UI (must match *Output() ids)
-# session = info/hooks tied to this specific browser connection
 server <- function(input, output, session) {
   
   # ---- Folder browsing setup ----------------------------------------------
-  # shinyFiles needs to know which top-level "roots" it's allowed to browse
-  # from (for security -- you don't want a web app browsing a server's
-  # entire filesystem by default). We offer the user's home folder, the
-  # R installation folder, and whatever drives shinyFiles auto-detects
-  # (C:\, D:\, etc. on Windows).
   volumes <- c(
     Home = fs::path_home(),
     "R Installation" = R.home(),
     shinyFiles::getVolumes()()
   )
   
-  # This wires up input$dir to actually respond to shinyDirButton clicks,
-  # using the roots we just defined.
   shinyDirChoose(input, "dir", roots = volumes, session = session)
   
-  # ---- Reactive: the currently selected folder ----------------------------
-  # reactive() creates a value that automatically recalculates whenever
-  # something it depends on (here, input$dir) changes. Think of it like a
-  # lazy, auto-updating variable. We call it as selected_dir() elsewhere,
-  # like calling a function, even though it behaves like reactive data.
   selected_dir <- reactive({
-    # req() is a guard clause: if input$dir isn't set yet (user hasn't
-    # picked a folder), stop here quietly instead of throwing an error.
     req(input$dir)
-    
-    # shinyFiles gives us back a compact internal representation of the
-    # chosen path; parseDirPath() converts it into an actual usable
-    # file system path string.
     parseDirPath(volumes, input$dir)
   })
   
-  # ---- Output: show which folder is selected ------------------------------
-  # renderPrint() captures whatever gets printed/cat()'d and sends it to
-  # the matching verbatimTextOutput("dirpath") in the UI.
   output$dirpath <- renderPrint({
     if (is.integer(input$dir)) {
-      # input$dir starts out as an integer placeholder before any
-      # selection has been made -- this is the "nothing picked yet" state.
       cat("No folder selected yet")
     } else {
       cat("Selected:", selected_dir())
     }
   })
   
-  # ---- Reactive: the file manifest, built only on button click ------------
-  # eventReactive() is like reactive(), but it only recalculates when a
-  # SPECIFIC trigger fires -- here, input$run (the action button) -- rather
-  # than any time any dependency changes. This is what makes the manifest
-  # build "on demand" instead of re-running every time selected_dir()
-  # changes (e.g. while the user is still browsing folders).
   manifest <- eventReactive(input$run, {
-    req(selected_dir())  # don't run if no folder has been picked
+    req(selected_dir())
     
-    # withProgress()/incProgress() show a progress bar in the UI while
-    # this block runs -- purely cosmetic, doesn't affect the logic.
     withProgress(message = "Building file manifest...", value = 0.3, {
       files <- build_manifest_from_dir(selected_dir())
       incProgress(0.7)
-      files  # eventReactive returns whatever the block's last line is
+      files
     })
   })
   
-  # ---- Reactive: the single table shown in the UI --------------------------
-  # results_data() holds whatever should currently be displayed:
-  #   - the manifest, once Step 1 has run
-  #   - then the extracted frames, once Step 2 has also run
-  #   - then the detections, once Step 3 has also run
-  # reactiveVal() is a plain mutable reactive value (unlike reactive()/
-  # eventReactive(), which derive their value from a formula) -- we update
-  # it explicitly with observeEvent() below whenever a step completes.
   results_data <- reactiveVal(NULL)
-  
-  # Separate from results_data(): this holds the clean, pre-detection
-  # data (manifest or extracted frames) that Step 3 should always detect
-  # against -- NOT whatever is currently displayed. Without this,
-  # clicking "Detect Animals" more than once would re-run detection on
-  # the previous detection output (which already has multiple rows per
-  # image), multiplying rows on every click instead of replacing them.
   detection_input <- reactiveVal(NULL)
   
   observeEvent(input$run, {
@@ -560,20 +497,17 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$extract, {
-    req(manifest())  # Step 2 requires Step 1 to have already run
+    req(manifest())
     
     withProgress(message = "Extracting frames...", value = 0.2, {
       allframes <- extract_video_frames(manifest(), input$frames_per_video)
       incProgress(0.8)
-      results_data(allframes)  # replaces the manifest in the same table
+      results_data(allframes)
       detection_input(allframes)
     })
   })
   
   # ---- Model file picker setup ---------------------------------------------
-  # Same pattern as the folder picker, but shinyFileChoose() for a single
-  # file instead of shinyDirChoose() for a directory. filetypes restricts
-  # the browser dialog to .pt files.
   shinyFileChoose(input, "model_file", roots = volumes, session = session,
                   filetypes = c("pt"))
   
@@ -591,7 +525,6 @@ server <- function(input, output, session) {
   })
   
   # ---- Class list file picker setup -----------------------------------------
-  # Same pattern as the model file picker.
   shinyFileChoose(input, "class_list_file", roots = volumes, session = session,
                   filetypes = c("csv"))
   
@@ -609,36 +542,29 @@ server <- function(input, output, session) {
   })
   
   # ---- Step 3: Detect Animals -----------------------------------------------
-  # Same pattern as Steps 1 and 2: only runs on its own button click, and
-  # req(detection_input()) blocks it from running before earlier steps have.
   observeEvent(input$detect, {
     req(selected_model())
     req(detection_input())
     
     withProgress(message = "Running detector...", value = 0.1, {
-      # NOTE: this loads the model fresh on every click. Fine for now
-      # while we're building the pipeline step by step, but worth
-      # caching the loaded detector later if this becomes a bottleneck
-      # (e.g. reusing it across multiple detection runs in one session).
       detector <- load_md_detector(selected_model(), input$model_type, input$device)
       incProgress(0.2)
       
-      # Build the category_map from the class list, if one was
-      # selected -- passed natively into detect() rather than merged
-      # on after the fact (see CATEGORY LABELS note at top of file).
+      # category_map must never be NULL or a bare empty list() -- see
+      # the CATEGORY LABELS note at the top of this file.
       category_map <- reticulate::dict()
       if (!is.null(input$class_list_file) && !is.integer(input$class_list_file)) {
         category_map <- build_category_map(selected_class_list())
-      } else if (input$model_type %in% c("mdv5", "mdv6", "mdv1000-cedar", "mdv1000-larch", "mdv1000-sorrel", "mdv1000-redwood", "mdv1000-spruce")) {
+      } else if (input$model_type %in% c("mdv5", "mdv6", "mdv1000-cedar", "mdv1000-larch",
+                                         "mdv1000-sorrel", "mdv1000-redwood", "mdv1000-spruce")) {
         category_map <- default_md_category_map()
       }
       incProgress(0.1)
       
       # Resize dimensions depend on model architecture -- MDv5/YOLOv5
-      # requires a SQUARE input (the documented MegaDetector v5
-      # standard is 1280x1280); our custom YOLO11 model runs fine at
-      # native resolution (2048x1440). Mixing these up throws a
-      # PyTorch tensor-shape-mismatch error from inside the model.
+      # requires a SQUARE input (1280x1280); our custom YOLO11 model
+      # runs fine at native resolution (2048x1440). See the RESIZE
+      # DIMENSIONS note at the top of this file.
       if (input$model_type %in% c("mdv5", "yolov5")) {
         resize_w <- 1280
         resize_h <- 1280
@@ -647,26 +573,18 @@ server <- function(input, output, session) {
         resize_h <- 1440
       }
       
-      # Always detect against detection_input() (the frozen pre-detection
-      # data), never results_data() -- keeps repeated clicks idempotent
-      # instead of compounding on the previous detection output.
       detections <- detect_animals(
         detector, detection_input(), input$device,
-        category_map          = category_map,
-        confidence_threshold   = input$confidence_threshold,
+        category_map            = category_map,
+        confidence_threshold     = input$confidence_threshold,
         resize_width             = resize_w,
         resize_height            = resize_h
       )
       
-      # The model can return multiple ranked category guesses for the
-      # same physical detection (near-identical bbox, different
-      # category/conf) -- collapse those down to just the top guess per
-      # box before anything else, so downstream steps see one row per
-      # real detected object.
       detections <- drop_duplicate_boxes(detections)
       incProgress(0.6)
       
-      results_data(detections)  # replaces whatever was in the table before
+      results_data(detections)
     })
   })
   
@@ -677,23 +595,49 @@ server <- function(input, output, session) {
     if (n == 0) {
       "No rows to show yet."
     } else {
-      paste0("Showing ", n, " row(s).")
+      paste0("Showing ", n, " row(s). Click a row to preview its bounding box.")
     }
   })
   
   # ---- Output: the interactive table ---------------------------------------
-  # renderDT() / DTOutput() is the DT-package equivalent of
-  # renderTable()/tableOutput(), but with sorting, searching, and paging.
+  # selection = "single" lets the user click exactly one row; that
+  # selection is what input$results_table_rows_selected exposes below.
   output$results_table <- renderDT({
     req(results_data())
-    datatable(results_data(), options = list(scrollX = TRUE, pageLength = 15))
+    datatable(
+      results_data(),
+      selection = "single",
+      options = list(scrollX = TRUE, pageLength = 15)
+    )
   })
   
+  # ---- Reactive: the currently selected row's data --------------------------
+  # input$results_table_rows_selected is a DT-provided input, auto-named
+  # from the results_table output id + "_rows_selected" suffix. It gives
+  # the row NUMBER (relative to the data frame passed to datatable(),
+  # not affected by the user sorting/searching client-side) of whichever
+  # row was last clicked.
+  selected_row <- reactive({
+    req(input$results_table_rows_selected)
+    results_data()[input$results_table_rows_selected, ]
+  })
+  
+  # ---- Output: image preview with bounding box -------------------------------
+  # renderImage() (paired with imageOutput() in the UI) is Shiny's
+  # mechanism for displaying an image file that lives on disk -- it
+  # expects a list with at minimum a "src" path, and deleteFile = TRUE
+  # cleans up the temp PNG draw_bbox_preview() creates after each render.
+  output$bbox_preview <- renderImage({
+    row <- selected_row()
+    
+    img_path <- draw_bbox_preview(
+      row$filepath, row$bbox_x, row$bbox_y, row$bbox_w, row$bbox_h
+    )
+    
+    list(src = img_path, contentType = "image/png", width = "100%")
+  }, deleteFile = TRUE)
+  
   # ---- Output: CSV download ---------------------------------------------
-  # downloadHandler() needs two pieces:
-  #   filename -> what the saved file should be called
-  #   content  -> a function that writes the data to the temp `file` path
-  #               Shiny hands it; Shiny then streams that file to the user
   output$download_manifest <- downloadHandler(
     filename = function() "file_manifest.csv",
     content = function(file) {
@@ -705,6 +649,5 @@ server <- function(input, output, session) {
 
 # ============================================================================
 # Launch the app by combining the ui and server pieces defined above.
-# This is the line RStudio's "Run App" button actually executes.
 # ============================================================================
 shinyApp(ui, server)

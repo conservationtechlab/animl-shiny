@@ -176,7 +176,7 @@ build_category_map <- function(class_list_path) {
   
   if (is.na(id_col) || is.na(label_col)) {
     warning("Could not identify ID/label columns in class list -- category_map will be empty.")
-    return(list())
+    return(reticulate::dict())
   }
   
   stats::setNames(
@@ -185,6 +185,19 @@ build_category_map <- function(class_list_path) {
   )
 }
 
+#' Default category map for genuine MegaDetector models
+#'
+#' MegaDetector's own standard categories, used as a fallback when
+#' model_type is "mdv5"/"mdv6" (or an mdv1000 variant) and no custom
+#' class list was selected -- without this, detect() crashes for MD
+#' models run without a class list, since our category_map would
+#' otherwise be NULL.
+#'
+#' @return named list, id -> label, matching MegaDetector's standard
+#'   empty/animal/person/vehicle categories
+default_md_category_map <- function() {
+  list(`0` = "empty", `1` = "animal", `2` = "person", `3` = "vehicle")
+}
 
 #' Drop duplicate candidate detections for the same bounding box
 #'
@@ -253,7 +266,7 @@ drop_duplicate_boxes <- function(detections, bbox_tolerance = 3) {
 #'   just the $detections list, not the wrapper -- passing the wrapper
 #'   directly throws "MD results input must be list" from the Python side.
 detect_animals <- function(detector, files, device,
-                           category_map = NULL,
+                           category_map = reticulate::dict(),
                            confidence_threshold = 0.1,
                            resize_width = 2048, resize_height = 1440,
                            batch_size = 1) {
@@ -613,11 +626,26 @@ server <- function(input, output, session) {
       # Build the category_map from the class list, if one was
       # selected -- passed natively into detect() rather than merged
       # on after the fact (see CATEGORY LABELS note at top of file).
-      category_map <- NULL
+      category_map <- reticulate::dict()
       if (!is.null(input$class_list_file) && !is.integer(input$class_list_file)) {
         category_map <- build_category_map(selected_class_list())
+      } else if (input$model_type %in% c("mdv5", "mdv6", "mdv1000-cedar", "mdv1000-larch", "mdv1000-sorrel", "mdv1000-redwood", "mdv1000-spruce")) {
+        category_map <- default_md_category_map()
       }
       incProgress(0.1)
+      
+      # Resize dimensions depend on model architecture -- MDv5/YOLOv5
+      # requires a SQUARE input (the documented MegaDetector v5
+      # standard is 1280x1280); our custom YOLO11 model runs fine at
+      # native resolution (2048x1440). Mixing these up throws a
+      # PyTorch tensor-shape-mismatch error from inside the model.
+      if (input$model_type %in% c("mdv5", "yolov5")) {
+        resize_w <- 1280
+        resize_h <- 1280
+      } else {
+        resize_w <- 2048
+        resize_h <- 1440
+      }
       
       # Always detect against detection_input() (the frozen pre-detection
       # data), never results_data() -- keeps repeated clicks idempotent
@@ -625,7 +653,9 @@ server <- function(input, output, session) {
       detections <- detect_animals(
         detector, detection_input(), input$device,
         category_map          = category_map,
-        confidence_threshold   = input$confidence_threshold
+        confidence_threshold   = input$confidence_threshold,
+        resize_width             = resize_w,
+        resize_height            = resize_h
       )
       
       # The model can return multiple ranked category guesses for the

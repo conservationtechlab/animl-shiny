@@ -264,7 +264,34 @@ detect_animals <- function(detector, files, device,
 #'
 #' @return string, path to a temp PNG file with the box drawn (or the
 #'   plain image if no valid box was given)
+#'
+#' @details If filepath is a video file (this happens when Step 3 runs
+#'   directly on Step 1's manifest, skipping Step 2's frame extraction
+#'   -- video rows still carry their original video filepath, not an
+#'   extracted still image), magick::image_read() cannot open it as a
+#'   still image and would crash. Rather than that, this returns an
+#'   informative placeholder image and points the user at Step 2.
 draw_bbox_preview <- function(filepath, bbox_x, bbox_y, bbox_w, bbox_h) {
+  video_extensions <- c("mp4", "avi", "mov", "wmv", "mkv", "m4v", "mpg", "mpeg")
+  ext <- tolower(tools::file_ext(filepath))
+  
+  if (ext %in% video_extensions) {
+    placeholder <- image_blank(width = 800, height = 450, color = "gray20")
+    placeholder <- image_annotate(
+      placeholder,
+      paste0(
+        "Preview not available for video files.\n",
+        "Run Step 2 (Extract Frames) first to get\n",
+        "still images that can be previewed.\n\n",
+        basename(filepath)
+      ),
+      gravity = "center", color = "white", size = 22
+    )
+    out_path <- tempfile(fileext = ".png")
+    image_write(placeholder, out_path)
+    return(out_path)
+  }
+  
   img <- image_read(filepath)
   info <- image_info(img)
   
@@ -546,45 +573,69 @@ server <- function(input, output, session) {
     req(selected_model())
     req(detection_input())
     
-    withProgress(message = "Running detector...", value = 0.1, {
-      detector <- load_md_detector(selected_model(), input$model_type, input$device)
-      incProgress(0.2)
-      
-      # category_map must never be NULL or a bare empty list() -- see
-      # the CATEGORY LABELS note at the top of this file.
-      category_map <- reticulate::dict()
-      if (!is.null(input$class_list_file) && !is.integer(input$class_list_file)) {
-        category_map <- build_category_map(selected_class_list())
-      } else if (input$model_type %in% c("mdv5", "mdv6", "mdv1000-cedar", "mdv1000-larch",
-                                         "mdv1000-sorrel", "mdv1000-redwood", "mdv1000-spruce")) {
-        category_map <- default_md_category_map()
-      }
-      incProgress(0.1)
-      
-      # Resize dimensions depend on model architecture -- MDv5/YOLOv5
-      # requires a SQUARE input (1280x1280); our custom YOLO11 model
-      # runs fine at native resolution (2048x1440). See the RESIZE
-      # DIMENSIONS note at the top of this file.
-      if (input$model_type %in% c("mdv5", "yolov5")) {
-        resize_w <- 1280
-        resize_h <- 1280
-      } else {
-        resize_w <- 2048
-        resize_h <- 1440
-      }
-      
-      detections <- detect_animals(
-        detector, detection_input(), input$device,
-        category_map            = category_map,
-        confidence_threshold     = input$confidence_threshold,
-        resize_width             = resize_w,
-        resize_height            = resize_h
+    # tryCatch wraps the whole block: if the selected model_type doesn't
+    # actually match the model file's real architecture (e.g. picking
+    # "MegaDetector v5/v6" for a custom YOLO11 model, or vice versa),
+    # load_detector()/detect() throw a raw Python exception that would
+    # otherwise crash the whole Shiny session. Catching it lets us show
+    # a clear, recoverable error message instead.
+    tryCatch({
+      withProgress(message = "Running detector...", value = 0.1, {
+        detector <- load_md_detector(selected_model(), input$model_type, input$device)
+        incProgress(0.2)
+        
+        # category_map must never be NULL or a bare empty list() -- see
+        # the CATEGORY LABELS note at the top of this file.
+        category_map <- reticulate::dict()
+        if (!is.null(input$class_list_file) && !is.integer(input$class_list_file)) {
+          category_map <- build_category_map(selected_class_list())
+        } else if (input$model_type %in% c("mdv5", "mdv6", "mdv1000-cedar", "mdv1000-larch",
+                                           "mdv1000-sorrel", "mdv1000-redwood", "mdv1000-spruce")) {
+          category_map <- default_md_category_map()
+        }
+        incProgress(0.1)
+        
+        # Resize dimensions depend on model architecture -- MDv5/YOLOv5
+        # requires a SQUARE input (1280x1280); our custom YOLO11 model
+        # runs fine at native resolution (2048x1440). See the RESIZE
+        # DIMENSIONS note at the top of this file.
+        if (input$model_type %in% c("mdv5", "yolov5")) {
+          resize_w <- 1280
+          resize_h <- 1280
+        } else {
+          resize_w <- 2048
+          resize_h <- 1440
+        }
+        
+        detections <- detect_animals(
+          detector, detection_input(), input$device,
+          category_map            = category_map,
+          confidence_threshold     = input$confidence_threshold,
+          resize_width             = resize_w,
+          resize_height            = resize_h
+        )
+        
+        detections <- drop_duplicate_boxes(detections)
+        incProgress(0.6)
+        
+        results_data(detections)
+      })
+    }, error = function(e) {
+      # Most common real-world cause: model_type doesn't match the
+      # actual architecture of the selected .pt file. Give the user
+      # that specific hint alongside the raw error, since the raw
+      # Python traceback alone isn't obvious to act on.
+      showNotification(
+        paste0(
+          "Detection failed -- this usually means the selected Model ",
+          "type doesn't match this model file's actual architecture ",
+          "(e.g. picking MegaDetector v5/v6 for a custom-trained model, ",
+          "or vice versa). Try a different Model type.\n\nRaw error: ",
+          conditionMessage(e)
+        ),
+        type = "error",
+        duration = NULL
       )
-      
-      detections <- drop_duplicate_boxes(detections)
-      incProgress(0.6)
-      
-      results_data(detections)
     })
   })
   

@@ -85,13 +85,10 @@
 #   guessing at an extracted-file naming convention that isn't
 #   reliable. See get_video_frame_path().
 #
-# COUNTING / CHICK EMERGENCE TRACKING -- requires the DEV branch of
-# animl-py, not the stable release:
-#   pip install git+https://github.com/conservationtechlab/animl-py.git@dev
-# count_detections() and sequence_calculation() (used by
-# count_species_over_time() below) are not yet in animl-r at all, so
-# we call the Python functions directly via reticulate rather than
-# through animl-r wrapper functions, which don't exist for these yet.
+# COUNTING / CHICK EMERGENCE TRACKING
+# Requires the feature/counting-wrappers branch of animl-r.
+# sequence_calculation() and count_detections() are called directly
+# through animl-r's R wrappers.
 #
 # Required packages:
 #   install.packages(c("shiny", "shinyFiles", "DT", "fs", "magick"))
@@ -396,26 +393,13 @@ derive_station <- function(filepaths, root_dir, camera_depth = 1) {
 
 #' Count a species over time, grouped into sequences, per station
 #'
-#' Wraps two functions from animl-py's DEV branch (not in the stable
-#' release -- see the COUNTING note at the top of this file):
-#' sequence_calculation() groups detections into time-based sequences
-#' by station + time gap; count_detections() then counts detections
-#' per species per sequence (averaged across images in that sequence).
-#' Neither of these has an R equivalent yet, so we call the Python
-#' functions directly via reticulate rather than going through
-#' animl-r's own wrapper functions (which don't exist for these yet).
-#'
-#' count_detections() itself doesn't return a date or station column
-#' (just a sequence ID + per-species counts) -- we call
-#' sequence_calculation() separately as well, purely to recover each
-#' sequence's earliest timestamp and its station (constant within a
-#' sequence, since sequences are built per-station), and join both
-#' onto the counts afterward. This is what makes per-station,
-#' over-time plots possible.
+#' Uses animl-r's counting wrappers:
+#'   sequence_calculation() groups detections into time-based sequences
+#'   by station + time gap; count_detections() then counts detections
+#'   per species per sequence (averaged across images in that sequence).
 #'
 #' @param detections data frame, output of detect_animals(). Must
-#'   already have a real station_col (e.g. from derive_station()) --
-#'   this function does not fabricate one.
+#'   already have a real station_col (e.g. from derive_station()).
 #' @param station_col string, column name representing the station/camera
 #' @param confidence_threshold numeric, minimum confidence to count a detection
 #' @param maxdiff numeric, max seconds between images to be considered
@@ -424,47 +408,55 @@ derive_station <- function(filepaths, root_dir, camera_depth = 1) {
 #'   values to count. NULL counts every non-"empty" class found.
 #'
 #' @return data frame, one row per sequence, with a count column per
-#'   requested species, plus datetime (earliest timestamp in that
-#'   sequence) and station_col -- ready to be aggregated per station
-#'   and plotted
+#' requested species, plus datetime and station_col.
 count_species_over_time <- function(detections, station_col = "station",
                                     confidence_threshold = 0.3,
                                     maxdiff = 60, classes = NULL) {
-  animl_py <- reticulate::import("animl")
   
-  tagged <- animl_py$sequence_calculation(
+  tagged <- sequence_calculation(
     detections,
     station_col = station_col,
-    maxdiff     = as.integer(maxdiff)
+    maxdiff = as.integer(maxdiff)
   )
   
-  counts <- animl_py$count_detections(
+  counts <- count_detections(
     detections,
-    station_col            = station_col,
-    confidence_threshold   = confidence_threshold,
-    maxdiff                = as.integer(maxdiff),
-    classes                = classes
+    station_col = station_col,
+    confidence_threshold = confidence_threshold,
+    maxdiff = as.integer(maxdiff),
+    classes = classes
   )
   
   # Coerce merge-key columns to plain atomic vectors before merging.
-  # Confirmed by direct testing: columns coming back from a pandas
-  # DataFrame via reticulate can occasionally arrive as non-plain-vector
-  # types (e.g. a list-column) instead of a simple character/numeric
-  # vector, which base R's merge() rejects with "'by' must specify a
-  # uniquely valid column" -- a genuinely confusing error message that
-  # has nothing to do with animl-py itself being missing or broken.
-  tagged$sequence          <- as.character(unlist(tagged$sequence))
-  tagged[[station_col]]    <- as.character(unlist(tagged[[station_col]]))
-  counts$sequence          <- as.character(unlist(counts$sequence))
+  tagged$sequence <- as.character(unlist(tagged$sequence))
+  tagged[[station_col]] <- as.character(unlist(tagged[[station_col]]))
+  counts$sequence <- as.character(unlist(counts$sequence))
   
-  # Earliest timestamp per sequence, to plot counts against. Station is
-  # constant within a sequence by construction (sequences are built
-  # per-station), so taking the first row's value per sequence is safe.
-  seq_dates   <- stats::aggregate(datetime ~ sequence, data = tagged, FUN = min)
-  seq_station <- tagged[!duplicated(tagged$sequence), c("sequence", station_col)]
-  seq_meta    <- merge(seq_dates, seq_station, by = "sequence")
+  # Earliest timestamp per sequence, to plot counts against.
+  # Station is constant within a sequence by construction.
+  seq_dates <- stats::aggregate(
+    datetime ~ sequence,
+    data = tagged,
+    FUN = min
+  )
   
-  merge(counts, seq_meta, by = "sequence", all.x = TRUE)
+  seq_station <- tagged[
+    !duplicated(tagged$sequence),
+    c("sequence", station_col)
+  ]
+  
+  seq_meta <- merge(
+    seq_dates,
+    seq_station,
+    by = "sequence"
+  )
+  
+  merge(
+    counts,
+    seq_meta,
+    by = "sequence",
+    all.x = TRUE
+  )
 }
 
 
@@ -706,9 +698,10 @@ ui <- fluidPage(
         "species over time -- one chart per station, matching the ",
         "\"Juvenile Density Curve\" style used for chick emergence ",
         "tracking. Requires Step 3 (Detect Animals) to have run first, ",
-        "and animl-py's dev branch to be installed (see the COUNTING ",
-        "note at the top of app.R)."
+        "and the feature/counting-wrappers branch of animl-r to be ",
+        "installed (see the COUNTING note at the top of app.R)."
       ),
+      
       
       downloadButton("download_counts", "Download Counts (CSV)")
     ),
